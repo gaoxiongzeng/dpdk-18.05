@@ -52,7 +52,7 @@
 #ifdef RTE_LIBRTE_PDUMP
 #include <rte_pdump.h>
 #endif
-#include <rte_flow.h>
+//#include <rte_flow.h>
 #include <rte_metrics.h>
 #ifdef RTE_LIBRTE_BITRATE
 #include <rte_bitrate.h>

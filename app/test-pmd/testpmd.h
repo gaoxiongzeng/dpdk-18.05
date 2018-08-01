@@ -9,6 +9,7 @@
 #include <rte_bus_pci.h>
 #include <rte_gro.h>
 #include <rte_gso.h>
+#include <rte_flow.h>
 
 #define RTE_PORT_ALL            (~(portid_t)0x0)
 
