@@ -77,17 +77,19 @@
 #define min(X,Y) ((X) < (Y) ? (X) : (Y))
 #define max(X,Y) ((X) > (Y) ? (X) : (Y))
 
-#define SERVERNUM 4
+#define SERVERNUM 3 // including one warm-up server
 static struct   ether_addr eth_addr_array[SERVERNUM];
 static uint32_t ip_addr_array[SERVERNUM];
 
-static int  verbose           = 1;
-static int  total_flow_num    = 4; // total flows for all servers
-static int  current_server_id = 0;
+int verbose           = 2;
+int total_flow_num    = 6; // total flows for all servers 
+int current_server_id = 1;
 
 /* Configuration files to be placed in app/test-pmd/config/ */
+/* The first line (server_id=0) is used for warm-up receiver */
 static const char ethaddr_filename[] = "app/test-pmd/config/eth_addr_info.txt";
 static const char ipaddr_filename[]  = "app/test-pmd/config/ip_addr_info.txt";
+/* The first few lines are used for warm-up flows */
 static const char flow_filename[]    = "app/test-pmd/config/flow_info.txt";
 
 #define DEFAULT_PKT_SIZE 1500
@@ -121,11 +123,13 @@ static const char flow_filename[]    = "app/test-pmd/config/flow_info.txt";
 #define DATA_LEN_16BITS tcp_urp
 
 /* Homa states */
-#define HOMA_SEND_GRANT_REQUEST_SENT 0x00
-#define HOMA_SEND_GRANT_RECEIVING 0x01
-#define HOMA_SEND_CLOSED 0x02
-#define HOMA_RECEIVE_GRANT_SENDING 0x03
-#define HOMA_RECEIVE_CLOSED 0x04
+#define HOMA_SEND_UNSTARTED 0x00
+#define HOMA_SEND_GRANT_REQUEST_SENT 0x01
+#define HOMA_SEND_GRANT_RECEIVING 0x02
+#define HOMA_SEND_CLOSED 0x03
+#define HOMA_RECV_UNSTARTED 0x04
+#define HOMA_RECV_GRANT_SENDING 0x05
+#define HOMA_RECV_CLOSED 0x06
 
 /* Homa transport configuration (parameters and variables) */
 #define RTT_BYTES 20000 // Calculated based on BDP
@@ -142,6 +146,7 @@ static const int prio_map[] = {0, 1, 2, 3, 4, 5, 6, 7}; // 0-n from low to high 
 
 double start_cycle, elapsed_cycle;
 double flowgen_start_time;
+int    sync_time = 3; // in sec
 double hz;
 struct fwd_stream *global_fs;
 
@@ -163,7 +168,14 @@ struct flow_info {
     uint32_t data_recv_next; 
     uint32_t granted_seqnum;
     uint32_t granted_priority;
-    double   last_grant_request_sent_time;
+
+    /* Used to detect grant request timeout */
+    double last_grant_request_sent_time;
+    
+    /* Used to avoid duplicate grants and detect timeout */
+    double last_grant_sent_time;
+    double last_grant_granted_seq;
+    double last_grant_granted_prio;
 };
 struct flow_info *sender_flows;
 struct flow_info *receiver_flows;
@@ -199,6 +211,9 @@ main_flowgen(struct fwd_stream *fs);
 
 static int
 start_new_flow(void);
+
+static void
+start_warm_up_flow(void);
 
 static void
 sender_send_pkt(void);
@@ -271,6 +286,9 @@ get_src_server_id(uint32_t flow_id, struct flow_info *flows);
 
 static inline int
 get_dst_server_id(uint32_t flow_id, struct flow_info *flows);
+
+static inline void
+print_elapsed_time(void);
 
 static void
 print_fct(void);
@@ -382,13 +400,13 @@ add_receiver_active_flow(int flow_id)
     }
     receiver_active_flow_num++;
     receiver_total_flow_num++;
-    receiver_flows[flow_id].flow_state = HOMA_RECEIVE_GRANT_SENDING;
+    receiver_flows[flow_id].flow_state = HOMA_RECV_GRANT_SENDING;
 }
 
 static inline int
 find_next_sender_grant_request_sent_flow(int start_index)
 {
-    for (int i=start_index+1; i<MAX_CONCURRENT_FLOW; i++) {
+    for (int i=start_index; i<MAX_CONCURRENT_FLOW; i++) {
         if (sender_request_sent_flow_array[i] != -1) {
             return i;
         }
@@ -410,7 +428,7 @@ remove_receiver_active_flow(int flow_id)
         printf("error: cannot find the node for remove_receiver_active_flow\n");
     }
     receiver_active_flow_num--;
-    receiver_flows[flow_id].flow_state = HOMA_RECEIVE_CLOSED;
+    receiver_flows[flow_id].flow_state = HOMA_RECV_CLOSED;
     receiver_flows[flow_id].flow_finished = 1;
     receiver_flows[flow_id].finish_time = rte_rdtsc() / (double)hz;
     receiver_finished_flow_num++;
@@ -462,16 +480,29 @@ static inline int
 find_next_unstart_flow_id(void)
 {
     int i;
-    for (i=sender_next_unstart_flow_id+1; i<sender_total_flow_num; i++) {
+    for (i=sender_next_unstart_flow_id+1; i<total_flow_num; i++) {
         if (get_src_server_id(i, sender_flows) == current_server_id)
             return i;
     }
     return i;
 }
 
+/* Update and print global elapsed time */
+static inline void
+print_elapsed_time(void)
+{
+    elapsed_cycle = rte_rdtsc() - start_cycle;
+    printf("Time: %lf", elapsed_cycle/(double)hz);
+}
+
 static void
 print_fct(void)
 {
+    printf("Summary:\ntotal_flow_num = %d (including %d warm up flows)\n"
+        "sender_total_flow_num = %d (including 1 warm up flow)\n"
+        "receiver_total_flow_num = %d\nReceiver FCT:\n",
+        total_flow_num, SERVERNUM-1, sender_total_flow_num, receiver_total_flow_num);
+
     for (int i=0; i<total_flow_num; i++) {
         if (receiver_flows[i].fct_printed == 0 && receiver_flows[i].flow_finished == 1) {
              printf("%d %lf\n", i, 
@@ -502,8 +533,9 @@ read_config(void)
             &eth_addr_array[server_id].addr_bytes[3], &eth_addr_array[server_id].addr_bytes[4], 
             &eth_addr_array[server_id].addr_bytes[5]);
         if (verbose > 0) {
-           printf("\nServer id = %d   ", server_id);
-           print_ether_addr("eth=", &eth_addr_array[server_id]);
+           printf("Server id = %d   ", server_id);
+           print_ether_addr("eth = ", &eth_addr_array[server_id]);
+           printf("\n");
         }
         server_id++;
     }
@@ -519,18 +551,16 @@ read_config(void)
         sscanf(line, "%u %u %u %u", &src_ip_segment1, &src_ip_segment2, &src_ip_segment3, &src_ip_segment4);
         ip_addr_array[server_id] = IPv4(src_ip_segment1, src_ip_segment2, src_ip_segment3, src_ip_segment4);
         if (verbose > 0) {
-            printf("\nServer id = %d   ", server_id);
-            printf("ip=%u.%u.%u.%u (%u)", src_ip_segment1, src_ip_segment2, 
+            printf("Server id = %d   ", server_id);
+            printf("ip = %u.%u.%u.%u (%u)\n", src_ip_segment1, src_ip_segment2, 
                 src_ip_segment3, src_ip_segment4, ip_addr_array[server_id]);
         }
         server_id++;
     }
     fclose(fd);
-
-    printf("\nEnd of read_config\n\n");
 }
 
-/* Init sender flow info */
+/* Init flow info */
 static void
 init(void)
 {
@@ -552,14 +582,20 @@ init(void)
             &src_ip_segment1, &src_ip_segment2, &src_ip_segment3, &src_ip_segment4, 
             &dst_ip_segment1, &dst_ip_segment2, &dst_ip_segment3, &dst_ip_segment4, 
             &udp_src_port, &udp_dst_port, &flow_size, &start_time);
-        sender_flows[flow_id].src_ip      = IPv4(src_ip_segment1, src_ip_segment2, src_ip_segment3, src_ip_segment4);
-        sender_flows[flow_id].dst_ip      = IPv4(dst_ip_segment1, dst_ip_segment2, dst_ip_segment3, dst_ip_segment4);
-        sender_flows[flow_id].src_port    = udp_src_port;
-        sender_flows[flow_id].dst_port    = udp_dst_port;
-        sender_flows[flow_id].flow_size   = flow_size;
-        sender_flows[flow_id].remain_size = flow_size;
-        sender_flows[flow_id].data_seqnum = 1;
-        sender_flows[flow_id].start_time  = start_time;
+        sender_flows[flow_id].src_ip               = IPv4(src_ip_segment1, src_ip_segment2, 
+                                                          src_ip_segment3, src_ip_segment4);
+        sender_flows[flow_id].dst_ip               = IPv4(dst_ip_segment1, dst_ip_segment2, 
+                                                          dst_ip_segment3, dst_ip_segment4);
+        sender_flows[flow_id].src_port             = udp_src_port;
+        sender_flows[flow_id].dst_port             = udp_dst_port;
+        sender_flows[flow_id].flow_size            = flow_size;
+        sender_flows[flow_id].remain_size          = flow_size;
+        sender_flows[flow_id].data_seqnum          = 1;
+        sender_flows[flow_id].start_time           = start_time;
+        sender_flows[flow_id].last_grant_sent_time = 0;
+        sender_flows[flow_id].flow_state           = HOMA_SEND_UNSTARTED;
+
+        receiver_flows[flow_id].flow_state = HOMA_RECV_UNSTARTED;
 
         if (get_src_server_id(flow_id, sender_flows) == current_server_id)
             sender_total_flow_num++;
@@ -572,27 +608,20 @@ init(void)
                 sender_flows[flow_id].flow_size, sender_flows[flow_id].start_time); 
         }
     }
+    /* find the fisrt flow to start for this server */
+    sender_next_unstart_flow_id = -1;
     sender_next_unstart_flow_id = find_next_unstart_flow_id();
     fclose(fd);
 
-    /*sender_request_sent_flow_array = rte_zmalloc("testpmd: int", 
-        MAX_CONCURRENT_FLOW*sizeof(int), RTE_CACHE_LINE_SIZE);
-    sender_active_flow_array = rte_zmalloc("testpmd: int", 
-        MAX_CONCURRENT_FLOW*sizeof(int), RTE_CACHE_LINE_SIZE);
-    receiver_active_flow_array = rte_zmalloc("testpmd: int", 
-        MAX_CONCURRENT_FLOW*sizeof(int), RTE_CACHE_LINE_SIZE);*/
     for (int i=0; i<MAX_CONCURRENT_FLOW; i++) {
         sender_request_sent_flow_array[i] = -1;
         sender_active_flow_array[i] = -1;
         receiver_active_flow_array[i] = -1;
     }
 
-    if (verbose > 0) {
+    if (verbose > 0)
         printf("Flow info summary: total_flow_num = %d, sender_total_flow_num = %d\n",
             total_flow_num, sender_total_flow_num);
-    }
-
-    printf("End of init\n\n");
 }
 
 static void
@@ -665,10 +694,20 @@ construct_grant_request(uint32_t flow_id)
     pkt->vlan_tci_outer = ports[global_fs->tx_port].tx_vlan_id_outer;
     pkt->l2_len         = L2_LEN;
     pkt->l3_len         = L3_LEN;
+
+    /* grant requests should be sent immediately */
     sender_pkts_burst[sender_current_burst_size] = pkt;
     sender_current_burst_size++;
-    if (sender_current_burst_size >= BURST_THRESHOLD) {
+    if (sender_current_burst_size >= 1) {
+        if (verbose > 1) {
+            print_elapsed_time();
+            printf(" - construct_grant_request of flow %u ready to send\n", flow_id);
+        }
         sender_send_pkt();
+        if (verbose > 1) {
+            print_elapsed_time();
+            printf(" - construct_grant_request of flow %u sent\n", flow_id);
+        }
         sender_current_burst_size = 0;
     }
 }
@@ -744,6 +783,7 @@ construct_grant(uint32_t flow_id, uint32_t seq_granted, uint8_t priority_granted
     pkt->vlan_tci_outer = ports[global_fs->tx_port].tx_vlan_id_outer;
     pkt->l2_len         = L2_LEN;
     pkt->l3_len         = L3_LEN;
+
     receiver_pkts_burst[receiver_current_burst_size] = pkt;
     receiver_current_burst_size++;
     if (receiver_current_burst_size >= BURST_THRESHOLD) {
@@ -829,6 +869,7 @@ construct_data(uint32_t flow_id, uint32_t ack_seq)
     pkt->vlan_tci_outer = ports[global_fs->tx_port].tx_vlan_id_outer;
     pkt->l2_len         = L2_LEN;
     pkt->l3_len         = L3_LEN;
+
     sender_pkts_burst[sender_current_burst_size] = pkt;
     sender_current_burst_size++;
     if (sender_current_burst_size >= BURST_THRESHOLD) {
@@ -844,11 +885,20 @@ process_ack(struct tcp_hdr* transport_recv_hdr)
     uint16_t flow_id = (uint16_t)rte_be_to_cpu_16(transport_recv_hdr->FLOW_ID_16BITS);
 
     if (rte_be_to_cpu_32(transport_recv_hdr->sent_seq) != receiver_flows[flow_id].data_recv_next) {
-        printf("[%d] : data loss detected. (expected = %u, received = %u)\n", flow_id, 
+        print_elapsed_time();
+        printf(" - flow %d: data loss detected. (expected = %u, received = %u)\n", flow_id, 
             receiver_flows[flow_id].data_recv_next, rte_be_to_cpu_32(transport_recv_hdr->sent_seq));
     }
     receiver_flows[flow_id].data_recv_next += datalen;
     receiver_flows[flow_id].remain_size -= datalen;
+    
+    if (verbose > 0) {
+        print_elapsed_time();
+        printf(" - process_ack of flow %u, data_recv_next=%u, remain_size=%u\n", 
+            flow_id, receiver_flows[flow_id].data_recv_next, 
+            receiver_flows[flow_id].remain_size);
+    }
+
     if (receiver_flows[flow_id].remain_size <= 0) {
         remove_receiver_active_flow(flow_id);
     }
@@ -862,11 +912,12 @@ recv_grant_request(struct tcp_hdr *transport_recv_hdr, struct ipv4_hdr *ipv4_hdr
     uint32_t flow_size_highpart = ((uint32_t)transport_recv_hdr->FLOW_SIZE_HIGH_16BITS << 16) & 0xffff0000;
     uint32_t flow_size = flow_size_highpart + flow_size_lowpart;
 
-    if (receiver_flows[flow_id].flow_state == HOMA_RECEIVE_GRANT_SENDING)
+    if (receiver_flows[flow_id].flow_state != HOMA_RECV_UNSTARTED)
         return 0; 
     
-    if (verbose > 0) {
-        printf("receive grant request of flow %u\n", flow_id);
+    if (verbose > 1) {
+        print_elapsed_time();
+        printf(" - recv_grant_request of flow %u\n", flow_id);
     }
 
     add_receiver_active_flow(flow_id);
@@ -893,27 +944,41 @@ recv_grant(struct tcp_hdr *transport_recv_hdr)
     uint32_t seq_granted_lowpart = (uint32_t)rte_be_to_cpu_16(transport_recv_hdr->SEQ_GRANTED_LOW_16BITS);
     uint32_t seq_granted_highpart = ((uint32_t)transport_recv_hdr->SEQ_GRANTED_HIGH_16BITS << 16) & 0xffff0000;
     uint32_t seq_granted = seq_granted_highpart + seq_granted_lowpart;
+    uint8_t  priority_granted = transport_recv_hdr->PRIORITY_GRANTED_8BITS;
     struct   rte_mbuf *queued_pkt;
     struct   tcp_hdr *transport_hdr;
     int      queued_pkt_type, queued_flow_id;
+
+    if (verbose > 1) {
+        print_elapsed_time();
+        printf(" - recv_grant of flow %u, seq_granted=%u, priority_granted=%u\n", 
+            flow_id, seq_granted, priority_granted);
+    }
 
     switch (sender_flows[flow_id].flow_state) {
         case HOMA_SEND_GRANT_REQUEST_SENT:
             remove_sender_grant_request_sent_flow(flow_id);
         case HOMA_SEND_GRANT_RECEIVING:
             sender_flows[flow_id].granted_seqnum = seq_granted;
-            sender_flows[flow_id].granted_priority = transport_recv_hdr->PRIORITY_GRANTED_8BITS;
+            sender_flows[flow_id].granted_priority = priority_granted;
             /* construct new data according to SRPT */
-            queued_pkt = sender_pkts_burst[sender_current_burst_size-1];
-            transport_hdr = rte_pktmbuf_mtod_offset(queued_pkt, struct tcp_hdr *, L2_LEN + L3_LEN);
-            queued_pkt_type = transport_hdr->PKT_TYPE_8BITS;
-            queued_flow_id = transport_hdr->FLOW_ID_16BITS;
-            if (queued_pkt_type == PT_HOMA_DATA && 
-                sender_flows[queued_flow_id].remain_size > sender_flows[flow_id].remain_size) {
-                while (sender_flows[flow_id].remain_size > 0 &&
-                    sender_flows[flow_id].granted_seqnum > sender_flows[flow_id].data_seqnum) {
-                    construct_data(flow_id, transport_recv_hdr->sent_seq);
+            if (sender_current_burst_size > 0) {
+                queued_pkt = sender_pkts_burst[sender_current_burst_size-1];
+                transport_hdr = rte_pktmbuf_mtod_offset(queued_pkt, struct tcp_hdr *, L2_LEN + L3_LEN);
+                queued_pkt_type = transport_hdr->PKT_TYPE_8BITS;
+                queued_flow_id = transport_hdr->FLOW_ID_16BITS;
+                if (queued_pkt_type == PT_HOMA_DATA && 
+                    sender_flows[queued_flow_id].remain_size > sender_flows[flow_id].remain_size) {
+                    while (sender_flows[flow_id].remain_size > 0 &&
+                        sender_flows[flow_id].granted_seqnum > sender_flows[flow_id].data_seqnum) {
+                        construct_data(flow_id, transport_recv_hdr->sent_seq);
+                    }
                 }
+            } else {
+                while (sender_flows[flow_id].remain_size > 0 &&
+                        sender_flows[flow_id].granted_seqnum > sender_flows[flow_id].data_seqnum) {
+                        construct_data(flow_id, transport_recv_hdr->sent_seq);
+                    }
             }
             if (sender_flows[flow_id].remain_size == 0) {
                 sender_finished_flow_num++;
@@ -930,8 +995,17 @@ recv_data(struct tcp_hdr *transport_recv_hdr)
 {
     uint16_t flow_id = rte_be_to_cpu_16(transport_recv_hdr->FLOW_ID_16BITS);
 
+    if (verbose > 1) {
+        print_elapsed_time();
+        printf(" - recv_data of flow %u\n", flow_id);
+    }
+
     // drop all data packets if received before the grant requests
-    if (receiver_flows[flow_id].flow_state != HOMA_RECEIVE_GRANT_SENDING) {
+    if (receiver_flows[flow_id].flow_state != HOMA_RECV_GRANT_SENDING) {
+        if (verbose > 1) {
+            print_elapsed_time();
+            printf(" - recv_data of flow %u and dropped due to no grant request\n", flow_id);
+        }
         return;
     }
 
@@ -999,7 +1073,23 @@ send_grant(void)
     for (int i=0; i<SCHEDULED_PRIORITY; i++) {
         if (receiver_active_flow_array[i] >= 0) {
             int flow_id = receiver_active_flow_array[i];
-            construct_grant(flow_id, receiver_flows[flow_id].data_recv_next+RTT_BYTES, prio_map[i]);
+            uint32_t seq_granted = min(receiver_flows[flow_id].flow_size+1, 
+                receiver_flows[flow_id].data_recv_next+RTT_BYTES);
+            uint8_t priority_granted = prio_map[i];
+            double now = rte_rdtsc() / (double)hz;
+            if ((now - sender_flows[flow_id].last_grant_sent_time) > RETRANSMIT_TIMEOUT ||
+                sender_flows[flow_id].last_grant_granted_seq != seq_granted ||
+                sender_flows[flow_id].last_grant_granted_prio != priority_granted) {
+                if (verbose > 1) {
+                    print_elapsed_time();
+                    printf(" - send_grant of flow %u, seq_granted=%u, priority_granted=%u\n", 
+                        flow_id, seq_granted, priority_granted);
+                }
+                construct_grant(flow_id, seq_granted, priority_granted);
+                sender_flows[flow_id].last_grant_sent_time = now;
+                sender_flows[flow_id].last_grant_granted_seq = seq_granted;
+                sender_flows[flow_id].last_grant_granted_prio = priority_granted;
+            }
         }
         else
             break;
@@ -1016,6 +1106,10 @@ sender_send_pkt(void)
     if (unlikely(nb_tx < nb_pkt) && global_fs->retry_enabled) {
         uint32_t retry = 0;
         while (nb_tx < nb_pkt && retry++ < burst_tx_retry_num) {
+            if (verbose > 1) {
+                print_elapsed_time();
+                printf(" - sender_send_pkt, retry = %u\n", retry);
+            }
             rte_delay_us(burst_tx_delay_time);
             nb_tx += rte_eth_tx_burst(global_fs->tx_port, global_fs->tx_queue, 
                                         &sender_pkts_burst[nb_tx], nb_pkt - nb_tx);
@@ -1036,6 +1130,10 @@ receiver_send_pkt(void)
     if (unlikely(nb_tx < nb_pkt) && global_fs->retry_enabled) {
         uint32_t retry = 0;
         while (nb_tx < nb_pkt && retry++ < burst_tx_retry_num) {
+            if (verbose > 1) {
+                print_elapsed_time();
+                printf(" - receiver_send_pkt, retry = %u\n", retry);
+            }
             rte_delay_us(burst_tx_delay_time);
             nb_tx += rte_eth_tx_burst(global_fs->tx_port, global_fs->tx_queue, 
                                         &receiver_pkts_burst[nb_tx], nb_pkt - nb_tx);
@@ -1044,6 +1142,28 @@ receiver_send_pkt(void)
 
     global_fs->tx_packets += nb_tx;
     receiver_current_burst_size = 0;
+}
+
+/* Start one warm up flow - send data without receive */
+static void
+start_warm_up_flow(void)
+{
+    int flow_id = sender_next_unstart_flow_id;
+    sender_next_unstart_flow_id = find_next_unstart_flow_id();
+    
+    while (1) {
+        construct_data(flow_id, 0);
+        if (sender_flows[flow_id].remain_size <= 0)
+            break;
+    }
+
+    sender_send_pkt();
+    sender_finished_flow_num++;
+
+    if (verbose > 1) {
+        print_elapsed_time();
+        printf(" - start_warm_up_flow %d done\n", flow_id);
+    }
 }
 
 static int
@@ -1056,30 +1176,37 @@ start_new_flow(void)
         sender_send_pkt();
     }
 
-    /* retransmit timeout grant request */
+    /* Retransmit timeout grant request */
     max_request_retrans_check = min(MAX_REQUEST_RETRANSMIT_ONE_TIME, sender_grant_request_sent_flow_num);
     if (sender_grant_request_sent_flow_num > 0) {
-        retransmit_flow_index = 0;
+        retransmit_flow_index = find_next_sender_grant_request_sent_flow(0);
         request_retrans_check = 0;
         while (request_retrans_check < max_request_retrans_check) {
             now =  rte_rdtsc() / (double)hz; 
-            retransmit_flow_index = find_next_sender_grant_request_sent_flow(retransmit_flow_index);
             flow_id = sender_request_sent_flow_array[retransmit_flow_index];
             if ((now - sender_flows[flow_id].last_grant_request_sent_time) > RETRANSMIT_TIMEOUT) {
+                if (verbose > 1) {
+                    print_elapsed_time();
+                    printf(" - construct_grant_request %d due to RETRANSMIT_TIMEOUT\n"
+                        "                 last_grant_request_sent_time = %lf\n", flow_id, 
+                        sender_flows[flow_id].last_grant_request_sent_time - flowgen_start_time);
+                }
                 construct_grant_request(flow_id);
                 sender_flows[flow_id].last_grant_request_sent_time = now;
             }
+            retransmit_flow_index = find_next_sender_grant_request_sent_flow(retransmit_flow_index+1);
             request_retrans_check++;
         }
     }
 
-    /* start new flow */
-    if (sender_next_unstart_flow_id < sender_total_flow_num) {
+    /* Start new flow */
+    if (sender_next_unstart_flow_id < total_flow_num) {
         flow_id = sender_next_unstart_flow_id;
         now = rte_rdtsc() / (double)hz;
-        while ((sender_flows[flow_id].start_time + flowgen_start_time) <= now) {
-            if (verbose > 0) {
-                printf("start_new_flow %d at %lf\n", flow_id, now);
+        while ((sender_flows[flow_id].start_time + flowgen_start_time + sync_time) <= now) {
+            if (verbose > 1) {
+                print_elapsed_time();
+                printf(" - start_new_flow %d\n", flow_id);
             }
 
             construct_grant_request(flow_id);
@@ -1089,12 +1216,16 @@ start_new_flow(void)
             int max_unscheduled_pkt = RTT_BYTES / DEFAULT_PKT_SIZE;
             sender_flows[flow_id].granted_priority = map_to_unscheduled_priority(sender_flows[flow_id].flow_size);
             for (int i=0; i<max_unscheduled_pkt; i++) {
+                if (verbose > 1) {
+                    print_elapsed_time();
+                    printf(" - construct_data unscheduled %d of flow %d\n", i+1, flow_id);
+                }
                 construct_data(flow_id, 0);
-                if (sender_flows[flow_id].remain_size == 0)
+                if (sender_flows[flow_id].remain_size <= 0)
                     break;
             }
 
-            if (sender_next_unstart_flow_id < sender_total_flow_num) {
+            if (sender_next_unstart_flow_id < total_flow_num) {
                 flow_id = sender_next_unstart_flow_id;
             } else {
                 break;
@@ -1109,58 +1240,86 @@ start_new_flow(void)
 static void
 main_flowgen(struct fwd_stream *fs)
 {
+    /* Initialize global variables*/
+    rte_delay_ms(1000);
     global_fs = fs;
     hz = rte_get_timer_hz(); 
-
-    read_config(); /* read basic info of server number, mac and ip */
-
     sender_flows = rte_zmalloc("testpmd: struct flow_info",
             total_flow_num*sizeof(struct flow_info), RTE_CACHE_LINE_SIZE);
     receiver_flows = rte_zmalloc("testpmd: struct flow_info",
             total_flow_num*sizeof(struct flow_info), RTE_CACHE_LINE_SIZE);
-    
-    rte_delay_ms(2000);
-    init(); /* init sender flow info */
-    rte_delay_ms(2000);
 
+    /* Read basic info of server number, mac and ip */
+    printf("\nEnter read_config...\n\n");
+    read_config();
+    printf("\nExit read_config...\n\n");
+    
+    /* Init flow info */
+    printf("\nEnter init...\n\n");
+    init();
+    printf("\nExit init...\n\n");
+
+    /* Warm up and sync all servers */
+    printf("\nEnter warm up and sync loop...\n\n");
     start_cycle = rte_rdtsc();
     elapsed_cycle = 0;
     flowgen_start_time = start_cycle / (double)hz;
+    start_warm_up_flow();
+    /* Receiver only to sync all servers */
+    while (elapsed_cycle/(double)hz < sync_time) {
+        recv_pkt(fs);
+        send_grant();
+        elapsed_cycle = rte_rdtsc() - start_cycle;
+    }
+    printf("Warm up and sync delay = %d sec\n", sync_time);
+    printf("\nExit warm up and sync loop...\n\n");
+
+    /* Main flowgen loop */
+    printf("\nEnter main_flowgen loop...\n\n");
+    int loop_time = sync_time + 2; // main loop time in sec
     int main_flowgen_loop = 1;
     do {
-        if (verbose > 1) {
-            printf("main_flowgen_loop=%d at elapsed_time=%lf\n", main_flowgen_loop++, elapsed_cycle/(double)hz);
-            printf("Enter start_new_flow...\n");
+        if (verbose > 2) {
+            printf("main_flowgen_loop = %d\n", main_flowgen_loop++);
+            print_elapsed_time();
+            printf(" - enter start_new_flow...\n");
         }
 
         start_new_flow();
 
-        if (verbose > 1) {
-            printf("Exit start_new_flow...\n");
-            printf("Enter recv_pkt...\n");
+        if (verbose > 2) {
+            print_elapsed_time();
+            printf(" - enter recv_pkt...\n");
         }
-
+        
         recv_pkt(fs);
 
-        if (verbose > 1) {
-            printf("Exit recv_pkt...\n");
-            printf("Enter send_grant...\n");
+        if (verbose > 2) {
+            print_elapsed_time();
+            printf(" - enter send_grant...\n");
         }
 
         send_grant();
 
-        if (verbose > 1) {
-            printf("Exit send_grant...\n\n");
+        if (verbose > 2) {
+            print_elapsed_time();
+            printf(" - exit  send_grant...\n\n");
         }
 
-        elapsed_cycle = rte_rdtsc() - start_cycle; 
-        if (elapsed_cycle > 40*hz)
+        /* Break when reaching loop_time */
+        elapsed_cycle = rte_rdtsc() - start_cycle;
+        if (elapsed_cycle > loop_time*hz)
             break;
-    } while ( (elapsed_cycle < 40*hz) | 
-        (receiver_finished_flow_num < receiver_total_flow_num) | 
-        (sender_finished_flow_num < sender_total_flow_num) );
+    } /* Do not exit main loop if not reaching loop_time or not finishing all flows */
+    while (elapsed_cycle < loop_time*hz || receiver_finished_flow_num < receiver_total_flow_num || 
+        sender_finished_flow_num < sender_total_flow_num);
+    printf("\nExit main_flowgen loop...\n\n");
 
+    printf("\nEnter print_fct...\n\n");
     print_fct();
+    printf("\nExit print_fct...\n\n");
+
+    exit(0);
 }
 
 struct fwd_engine flow_gen_engine = {
