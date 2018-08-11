@@ -77,11 +77,13 @@
 #define min(X,Y) ((X) < (Y) ? (X) : (Y))
 #define max(X,Y) ((X) > (Y) ? (X) : (Y))
 
+#define ENABLE_AEOLUS 1
+
 #define SERVERNUM 3 // including one warm-up server
 static struct   ether_addr eth_addr_array[SERVERNUM];
 static uint32_t ip_addr_array[SERVERNUM];
 
-int verbose           = 2;
+int verbose           = 2; // verbose = 0 guarantees best performance
 int total_flow_num    = 6; // total flows for all servers 
 int current_server_id = 1;
 
@@ -108,6 +110,7 @@ static const char flow_filename[]    = "app/test-pmd/config/flow_info.txt";
 #define PT_HOMA_GRANT_REQUEST 0x10
 #define PT_HOMA_GRANT 0x11
 #define PT_HOMA_DATA 0x12
+#define PT_HOMA_RESEND_REQUEST 0x13
 
 /* Redefine TCP header fields for Homa */
 #define PKT_TYPE_8BITS tcp_flags
@@ -121,6 +124,8 @@ static const char flow_filename[]    = "app/test-pmd/config/flow_info.txt";
 #define SEQ_GRANTED_HIGH_16BITS cksum
 // Homa data header ONLY
 #define DATA_LEN_16BITS tcp_urp
+// Homa resend request header ONLY
+#define DATA_RESEND_16BITS tcp_urp
 
 /* Homa states */
 #define HOMA_SEND_UNSTARTED 0x00
@@ -172,6 +177,9 @@ struct flow_info {
     /* Used to detect grant request timeout */
     double last_grant_request_sent_time;
     
+    /* Used to detect data timeout */
+    double last_data_sent_time; /* to-do */
+
     /* Used to avoid duplicate grants and detect timeout */
     double last_grant_sent_time;
     double last_grant_granted_seq;
@@ -209,7 +217,7 @@ int receiver_active_flow_array[MAX_CONCURRENT_FLOW];
 static void
 main_flowgen(struct fwd_stream *fs);
 
-static int
+static void
 start_new_flow(void);
 
 static void
@@ -225,10 +233,16 @@ static void
 recv_pkt(struct fwd_stream *fs);
 
 static void
-recv_data(struct tcp_hdr *transport_recv_hdr);
+recv_grant_request(struct tcp_hdr *transport_recv_hdr, struct ipv4_hdr *ipv4_hdr);
 
 static void
 recv_grant(struct tcp_hdr *transport_recv_hdr);
+
+static void
+recv_data(struct tcp_hdr *transport_recv_hdr);
+
+static void
+recv_resend_request(struct tcp_hdr *transport_recv_hdr);
 
 static void
 process_ack(struct tcp_hdr* transport_recv_hdr);
@@ -240,7 +254,10 @@ static void
 construct_grant(uint32_t flow_id, uint32_t seq_granted, uint8_t priority_granted);
 
 static void
-construct_data(uint32_t flow_id, uint32_t ack_seq);
+construct_data(uint32_t flow_id, uint32_t ack_seq, int data_type);
+
+static void
+construct_resend_request(uint32_t flow_id, uint16_t resend_size);
 
 static void
 init(void);
@@ -657,7 +674,7 @@ construct_grant_request(uint32_t flow_id)
     ip_hdr = (struct ipv4_hdr *)(eth_hdr + 1);
     memset(ip_hdr, 0, L3_LEN);
     ip_hdr->version_ihl     = IP_VHL_DEF;
-    ip_hdr->type_of_service = 0; // highest priority for grant requests
+    ip_hdr->type_of_service = 0; // highest priority for grants & resend requests
     ip_hdr->fragment_offset = 0;
     ip_hdr->time_to_live    = IP_DEFTTL;
     ip_hdr->next_proto_id   = IPPROTO_TCP;
@@ -695,16 +712,16 @@ construct_grant_request(uint32_t flow_id)
     pkt->l2_len         = L2_LEN;
     pkt->l3_len         = L3_LEN;
 
-    /* grant requests should be sent immediately */
+    /* Grant requests should be sent immediately */
     sender_pkts_burst[sender_current_burst_size] = pkt;
     sender_current_burst_size++;
     if (sender_current_burst_size >= 1) {
-        if (verbose > 1) {
+        if (verbose > 2) {
             print_elapsed_time();
             printf(" - construct_grant_request of flow %u ready to send\n", flow_id);
         }
         sender_send_pkt();
-        if (verbose > 1) {
+        if (verbose > 2) {
             print_elapsed_time();
             printf(" - construct_grant_request of flow %u sent\n", flow_id);
         }
@@ -745,7 +762,7 @@ construct_grant(uint32_t flow_id, uint32_t seq_granted, uint8_t priority_granted
     ip_hdr = (struct ipv4_hdr *)(eth_hdr + 1);
     memset(ip_hdr, 0, L3_LEN);
     ip_hdr->version_ihl     = IP_VHL_DEF;
-    ip_hdr->type_of_service = 0; // highest priority for grants
+    ip_hdr->type_of_service = 0; // highest priority for grants & resend requests
     ip_hdr->fragment_offset = 0;
     ip_hdr->time_to_live    = IP_DEFTTL;
     ip_hdr->next_proto_id   = IPPROTO_TCP;
@@ -793,7 +810,7 @@ construct_grant(uint32_t flow_id, uint32_t seq_granted, uint8_t priority_granted
 }
 
 static void
-construct_data(uint32_t flow_id, uint32_t ack_seq)
+construct_data(uint32_t flow_id, uint32_t ack_seq, int data_type)
 {
     struct   ether_hdr *eth_hdr;
     struct   ipv4_hdr *ip_hdr;
@@ -801,7 +818,16 @@ construct_data(uint32_t flow_id, uint32_t ack_seq)
     uint64_t ol_flags, tx_offloads;
     uint16_t data_len;
     int      dst_server_id;
-    unsigned pkt_size = DEFAULT_PKT_SIZE;
+    unsigned pkt_size;
+
+    /* Data type (data_type): 
+        0 normal data pkt
+        1 unscheduled data pkt (selective dropping in Aeolus)
+        2 empty data pkt (probe after unscheduled data pkt in Aeolus) */
+    if (data_type < 2)
+        pkt_size = DEFAULT_PKT_SIZE;
+    else
+        pkt_size = HDR_ONLY_SIZE;
 
     struct rte_mempool *mbp = current_fwd_lcore()->mbp;
     struct rte_mbuf *pkt = rte_mbuf_raw_alloc(mbp);
@@ -835,7 +861,10 @@ construct_data(uint32_t flow_id, uint32_t ack_seq)
     ip_hdr->dst_addr        = rte_cpu_to_be_32(sender_flows[flow_id].dst_ip);
     ip_hdr->total_length    = RTE_CPU_TO_BE_16(pkt_size - L2_LEN);
     ip_hdr->hdr_checksum    = ip_sum((unaligned_uint16_t *)ip_hdr, L3_LEN);
-
+    /* Aeolus enables selective dropping for unscheduled data pkts */
+    if (ENABLE_AEOLUS && data_type == 1)  
+        ip_hdr->type_of_service |= 1; 
+    
     /* Initialize transport header. */
     transport_hdr = (struct tcp_hdr *)(ip_hdr + 1);
     transport_hdr->src_port       = rte_cpu_to_be_16(sender_flows[flow_id].src_port);
@@ -879,6 +908,92 @@ construct_data(uint32_t flow_id, uint32_t ack_seq)
 }
 
 static void
+construct_resend_request(uint32_t flow_id, uint16_t resend_size)
+{
+    struct   ether_hdr *eth_hdr;
+    struct   ipv4_hdr *ip_hdr;
+    struct   tcp_hdr *transport_hdr;
+    uint64_t ol_flags, tx_offloads;
+    int      dst_server_id;
+    unsigned pkt_size = HDR_ONLY_SIZE;
+
+    struct rte_mempool *mbp = current_fwd_lcore()->mbp;
+    struct rte_mbuf *pkt = rte_mbuf_raw_alloc(mbp);
+    if (!pkt) {
+        printf("flow_id = %d: allocation pkt error", flow_id);
+    }
+
+    pkt->data_len = pkt_size;
+    pkt->next = NULL;
+
+    /* Initialize Ethernet header. */
+    eth_hdr = rte_pktmbuf_mtod(pkt, struct ether_hdr *);
+    dst_server_id = get_dst_server_id(flow_id, receiver_flows);
+    if (dst_server_id == -1) {
+        printf("server error: cannot find server id\n");
+    }
+    ether_addr_copy(&eth_addr_array[dst_server_id], &eth_hdr->d_addr);
+    ether_addr_copy(&eth_addr_array[current_server_id], &eth_hdr->s_addr);
+    eth_hdr->ether_type = rte_cpu_to_be_16(ETHER_TYPE_IPv4);
+
+    /* Initialize IP header. */
+    ip_hdr = (struct ipv4_hdr *)(eth_hdr + 1);
+    memset(ip_hdr, 0, L3_LEN);
+    ip_hdr->version_ihl     = IP_VHL_DEF;
+    ip_hdr->type_of_service = 0; // highest priority for grants & resend requests
+    ip_hdr->fragment_offset = 0;
+    ip_hdr->time_to_live    = IP_DEFTTL;
+    ip_hdr->next_proto_id   = IPPROTO_TCP;
+    ip_hdr->packet_id       = 0;
+    ip_hdr->src_addr        = rte_cpu_to_be_32(receiver_flows[flow_id].src_ip);
+    ip_hdr->dst_addr        = rte_cpu_to_be_32(receiver_flows[flow_id].dst_ip);
+    ip_hdr->total_length    = RTE_CPU_TO_BE_16(pkt_size - L2_LEN);
+    ip_hdr->hdr_checksum    = ip_sum((unaligned_uint16_t *)ip_hdr, L3_LEN);
+
+    /* Initialize transport header. */
+    transport_hdr = (struct tcp_hdr *)(ip_hdr + 1);
+    transport_hdr->src_port           = rte_cpu_to_be_16(receiver_flows[flow_id].src_port);
+    transport_hdr->dst_port           = rte_cpu_to_be_16(receiver_flows[flow_id].dst_port);
+    transport_hdr->sent_seq           = rte_cpu_to_be_32(receiver_flows[flow_id].data_seqnum);
+    transport_hdr->recv_ack           = 0;
+    transport_hdr->PKT_TYPE_8BITS     = PT_HOMA_RESEND_REQUEST;
+    transport_hdr->DATA_RESEND_16BITS = rte_cpu_to_be_16((uint16_t)(resend_size & 0xffff));
+
+    tx_offloads = ports[global_fs->tx_port].dev_conf.txmode.offloads;
+    if (tx_offloads & DEV_TX_OFFLOAD_VLAN_INSERT)
+        ol_flags = PKT_TX_VLAN_PKT;
+    if (tx_offloads & DEV_TX_OFFLOAD_QINQ_INSERT)
+        ol_flags |= PKT_TX_QINQ_PKT;
+    if (tx_offloads & DEV_TX_OFFLOAD_MACSEC_INSERT)
+        ol_flags |= PKT_TX_MACSEC;
+
+    pkt->nb_segs        = 1;
+    pkt->data_len       = pkt_size;
+    pkt->pkt_len        = pkt_size;
+    pkt->ol_flags       = ol_flags;
+    pkt->vlan_tci       = ports[global_fs->tx_port].tx_vlan_id;
+    pkt->vlan_tci_outer = ports[global_fs->tx_port].tx_vlan_id_outer;
+    pkt->l2_len         = L2_LEN;
+    pkt->l3_len         = L3_LEN;
+
+    /* Resend requests should be sent immediately */
+    receiver_pkts_burst[receiver_current_burst_size] = pkt;
+    receiver_current_burst_size++;
+    if (receiver_current_burst_size >= 1) {
+        if (verbose > 2) {
+            print_elapsed_time();
+            printf(" - construct_resend_request of flow %u ready to send\n", flow_id);
+        }
+        receiver_send_pkt();
+        if (verbose > 2) {
+            print_elapsed_time();
+            printf(" - construct_resend_request of flow %u sent\n", flow_id);
+        }
+        receiver_current_burst_size = 0;
+    }
+}
+
+static void
 process_ack(struct tcp_hdr* transport_recv_hdr)
 {
     int datalen = rte_be_to_cpu_16(transport_recv_hdr->DATA_LEN_16BITS);
@@ -886,7 +1001,7 @@ process_ack(struct tcp_hdr* transport_recv_hdr)
 
     if (rte_be_to_cpu_32(transport_recv_hdr->sent_seq) != receiver_flows[flow_id].data_recv_next) {
         print_elapsed_time();
-        printf(" - flow %d: data loss detected. (expected = %u, received = %u)\n", flow_id, 
+        printf(" - flow %d: data reordering detected. (expected = %u, received = %u)\n", flow_id, 
             receiver_flows[flow_id].data_recv_next, rte_be_to_cpu_32(transport_recv_hdr->sent_seq));
     }
     receiver_flows[flow_id].data_recv_next += datalen;
@@ -900,11 +1015,35 @@ process_ack(struct tcp_hdr* transport_recv_hdr)
     }
 
     if (receiver_flows[flow_id].remain_size <= 0) {
-        remove_receiver_active_flow(flow_id);
+        if (receiver_flows[flow_id].flow_state != HOMA_RECV_CLOSED)
+            remove_receiver_active_flow(flow_id);
+        return;
+    }
+
+    /* datalen == 0 indicates an empty probe pkt. */
+    if (ENABLE_AEOLUS && datalen == 0) {
+        if (verbose > 0) {
+            print_elapsed_time();
+            printf(" - probe pkt received of flow %u\n", flow_id);
+        }
+        uint16_t resend_size = 0;
+        int received_size = receiver_flows[flow_id].flow_size - receiver_flows[flow_id].remain_size;
+        if (receiver_flows[flow_id].flow_size < RTT_BYTES) // flow_size unscheduled
+            resend_size = receiver_flows[flow_id].remain_size;
+        else if (RTT_BYTES > received_size) // RTT_BYTES unsheduled
+            resend_size = RTT_BYTES - received_size;
+        /* Send RESEND requests to inform the lost unscheduled packets if any. */
+        if (resend_size > 0) {
+            if (verbose > 0) {
+                print_elapsed_time();
+                printf(" - construct_resend_request of flow %u, resend_size=%u\n", flow_id, resend_size);
+            }
+            construct_resend_request(flow_id, resend_size);
+        }
     }
 }
 
-static int
+static void
 recv_grant_request(struct tcp_hdr *transport_recv_hdr, struct ipv4_hdr *ipv4_hdr)
 {
     uint16_t flow_id = rte_be_to_cpu_16(transport_recv_hdr->FLOW_ID_16BITS);
@@ -913,7 +1052,7 @@ recv_grant_request(struct tcp_hdr *transport_recv_hdr, struct ipv4_hdr *ipv4_hdr
     uint32_t flow_size = flow_size_highpart + flow_size_lowpart;
 
     if (receiver_flows[flow_id].flow_state != HOMA_RECV_UNSTARTED)
-        return 0; 
+        return; 
     
     if (verbose > 1) {
         print_elapsed_time();
@@ -933,8 +1072,6 @@ recv_grant_request(struct tcp_hdr *transport_recv_hdr, struct ipv4_hdr *ipv4_hdr
     receiver_flows[flow_id].flow_finished  = 0;
     receiver_flows[flow_id].data_recv_next = 1;
     receiver_flows[flow_id].data_seqnum    = 1;
-    
-    return 1;
 }
 
 static void
@@ -961,7 +1098,7 @@ recv_grant(struct tcp_hdr *transport_recv_hdr)
         case HOMA_SEND_GRANT_RECEIVING:
             sender_flows[flow_id].granted_seqnum = seq_granted;
             sender_flows[flow_id].granted_priority = priority_granted;
-            /* construct new data according to SRPT */
+            /* Construct new data according to SRPT */
             if (sender_current_burst_size > 0) {
                 queued_pkt = sender_pkts_burst[sender_current_burst_size-1];
                 transport_hdr = rte_pktmbuf_mtod_offset(queued_pkt, struct tcp_hdr *, L2_LEN + L3_LEN);
@@ -971,13 +1108,13 @@ recv_grant(struct tcp_hdr *transport_recv_hdr)
                     sender_flows[queued_flow_id].remain_size > sender_flows[flow_id].remain_size) {
                     while (sender_flows[flow_id].remain_size > 0 &&
                         sender_flows[flow_id].granted_seqnum > sender_flows[flow_id].data_seqnum) {
-                        construct_data(flow_id, transport_recv_hdr->sent_seq);
+                        construct_data(flow_id, transport_recv_hdr->sent_seq, 0);
                     }
                 }
             } else {
                 while (sender_flows[flow_id].remain_size > 0 &&
                         sender_flows[flow_id].granted_seqnum > sender_flows[flow_id].data_seqnum) {
-                        construct_data(flow_id, transport_recv_hdr->sent_seq);
+                        construct_data(flow_id, transport_recv_hdr->sent_seq, 0);
                     }
             }
             if (sender_flows[flow_id].remain_size == 0) {
@@ -1000,8 +1137,8 @@ recv_data(struct tcp_hdr *transport_recv_hdr)
         printf(" - recv_data of flow %u\n", flow_id);
     }
 
-    // drop all data packets if received before the grant requests
-    if (receiver_flows[flow_id].flow_state != HOMA_RECV_GRANT_SENDING) {
+    // Drop all data packets if received before the grant requests
+    if (receiver_flows[flow_id].flow_state < HOMA_RECV_GRANT_SENDING) {
         if (verbose > 1) {
             print_elapsed_time();
             printf(" - recv_data of flow %u and dropped due to no grant request\n", flow_id);
@@ -1011,6 +1148,23 @@ recv_data(struct tcp_hdr *transport_recv_hdr)
 
     process_ack(transport_recv_hdr);
 }
+
+static void
+recv_resend_request(struct tcp_hdr *transport_recv_hdr)
+{
+    uint16_t flow_id = rte_be_to_cpu_16(transport_recv_hdr->FLOW_ID_16BITS);
+    uint16_t resend_size = rte_be_to_cpu_16(transport_recv_hdr->DATA_RESEND_16BITS);
+
+    if (verbose > 1) {
+        print_elapsed_time();
+        printf(" - recv_resend_request of flow %u, resend_size=%u\n", flow_id, resend_size);
+    }
+
+    /* Roll back resend_size data pkts for resend if grants allowed. */
+    sender_flows[flow_id].data_seqnum -= resend_size; 
+    sender_flows[flow_id].remain_size += resend_size;
+}
+
 
 /* Receive and process a burst of packets. */
 static void
@@ -1053,6 +1207,8 @@ recv_pkt(struct fwd_stream *fs)
                 case PT_HOMA_DATA:
                     recv_data(transport_recv_hdr);
                     break;
+                case PT_HOMA_RESEND_REQUEST:
+                    recv_resend_request(transport_recv_hdr);
                 default:
                     break;
             }
@@ -1068,7 +1224,7 @@ send_grant(void)
         receiver_send_pkt();
     }
 
-    /* generate new grants for SCHEDULED_PRIORITY messages */
+    /* Generate new grants for SCHEDULED_PRIORITY messages */
     sort_receiver_active_flow_by_remaining_size();
     for (int i=0; i<SCHEDULED_PRIORITY; i++) {
         if (receiver_active_flow_array[i] >= 0) {
@@ -1152,7 +1308,7 @@ start_warm_up_flow(void)
     sender_next_unstart_flow_id = find_next_unstart_flow_id();
     
     while (1) {
-        construct_data(flow_id, 0);
+        construct_data(flow_id, 0, 0);
         if (sender_flows[flow_id].remain_size <= 0)
             break;
     }
@@ -1166,7 +1322,7 @@ start_warm_up_flow(void)
     }
 }
 
-static int
+static void
 start_new_flow(void)
 {
     double now;
@@ -1209,20 +1365,30 @@ start_new_flow(void)
                 printf(" - start_new_flow %d\n", flow_id);
             }
 
+            /* Send grant requests for new flows */
             construct_grant_request(flow_id);
             add_sender_grant_request_sent_flow(flow_id);
 
-            /* send RTT_BYTES unscheduled data */
-            int max_unscheduled_pkt = RTT_BYTES / DEFAULT_PKT_SIZE;
+            /* Send RTT_BYTES unscheduled data */
+            int max_unscheduled_pkt = RTT_BYTES / DEFAULT_PKT_SIZE + 1;
             sender_flows[flow_id].granted_priority = map_to_unscheduled_priority(sender_flows[flow_id].flow_size);
             for (int i=0; i<max_unscheduled_pkt; i++) {
                 if (verbose > 1) {
                     print_elapsed_time();
                     printf(" - construct_data unscheduled %d of flow %d\n", i+1, flow_id);
                 }
-                construct_data(flow_id, 0);
+                construct_data(flow_id, 0, 1);
                 if (sender_flows[flow_id].remain_size <= 0)
                     break;
+            }
+
+            /* Send probe pkt if Aeolus enabled */
+            if (ENABLE_AEOLUS) {
+                if (verbose > 1) {
+                    print_elapsed_time();
+                    printf(" - probe pkt sent of flow %u\n", flow_id);
+                }
+                construct_data(flow_id, 0, 2);
             }
 
             if (sender_next_unstart_flow_id < total_flow_num) {
@@ -1232,8 +1398,6 @@ start_new_flow(void)
             }
         }
     }
-
-    return 0;
 }
 
 /* flowgen packet_fwd main function */
