@@ -92,7 +92,7 @@ int current_server_id = 1;
 static const char ethaddr_filename[] = "app/test-pmd/config/eth_addr_info.txt";
 static const char ipaddr_filename[]  = "app/test-pmd/config/ip_addr_info.txt";
 /* The first few lines are used for warm-up flows */
-static const char flow_filename[]    = "app/test-pmd/config/flow_info.txt";
+static const char flow_filename[]    = "app/test-pmd/config/flow_info_test.txt";
 
 #define DEFAULT_PKT_SIZE 1500
 #define L2_LEN sizeof(struct ether_hdr)
