@@ -54,7 +54,7 @@ double poission_gen_interval(double avg_rate)
 int main(void) 
 {
     FILE   *output_flow_file = NULL;
-    char   output_filename[100] = "flow_info_gen.txt";
+    char   output_filename[100] = "../flow_info_gen.txt";
     int    flow_id = 0;
     int    flow_size = 0;
     double flow_start_time = 0.0; /* in second */
