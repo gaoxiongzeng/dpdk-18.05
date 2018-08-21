@@ -15,8 +15,8 @@ int    flow_total_time           = 0; /* total time to generate requests (in sec
 int    load                      = 1000; /* average network load in Mbps per host */
 struct cdf_table *flow_size_dist = NULL; /* flow distribution table*/
 char   flow_cdf_file[100]        = "cdf.txt"; /* flow size distribution file */
-int    header_size               = 78;
-int    max_ether_size            = 1538;
+int    header_size               = 54;
+int    max_ether_size            = 1500;
 
 /* IP address configuration */
 const char * const host_ip[] = {
