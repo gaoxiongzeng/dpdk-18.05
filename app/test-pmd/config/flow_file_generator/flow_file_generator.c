@@ -9,25 +9,36 @@
 #include "cdf.h"
 
 /* Basic flow settings */
-int    host_num                  = 3; /* number of hosts */
-int    flow_total_num            = 100; /* total number of flows to generate */
+int    host_num                  = 8; /* number of hosts */
+int    flow_total_num            = 10000; /* total number of flows to generate */
 int    flow_total_time           = 0; /* total time to generate requests (in seconds) */
-int    load                      = 1000; /* average network load in Mbps per host */
+int    load                      = 8000; /* average network load in Mbps per host */
+int    incast                    = 1; /* all-to-one when set to 1 */
 struct cdf_table *flow_size_dist = NULL; /* flow distribution table*/
-char   flow_cdf_file[100]        = "cdf.txt"; /* flow size distribution file */
+char   flow_cdf_file[100]        = "Incast_CDF.txt"; /* flow size distribution file */
 int    header_size               = 54;
 int    max_ether_size            = 1500;
 
 /* IP address configuration */
 const char * const host_ip[] = {
-    "192 168 111 0",
     "192 168 111 1",
-    "192 168 111 2"
+    "192 168 111 2",
+    "192 168 111 3",
+    "192 168 111 4",
+    "192 168 111 5",
+    "192 168 111 6",
+    "192 168 111 7",
+    "192 168 111 8"
 };
 const char * const fake_warm_up_dst_ip = "192 168 111 9";
 
 /* Port usage (port id used) */
 int host_port_offset[] = {
+    20000,
+    20000,
+    20000,
+    20000,
+    20000,
     20000,
     20000,
     20000
@@ -104,12 +115,18 @@ int main(void)
         int dst_host = rand() % host_num;
 
         /* Skip if the src_host and dst_host are the same */
-        while(src_host == dst_host)
+        while (src_host == dst_host)
             dst_host = rand() % host_num;
 
         /* Assign flow size and start time */
         flow_size = gen_random_cdf(flow_size_dist);
         flow_start_time = flow_start_time + poission_gen_interval(1.0 / period_us) / 1000000;
+
+        /* Incast: only accept dst_host = 0 */
+        if (incast && dst_host != 0) {
+            flow_id--;
+            continue;
+        }
 
         /* Write to output file */
         output_flow_file = fopen(output_filename, "a");

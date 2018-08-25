@@ -77,11 +77,11 @@
 #define min(X,Y) ((X) < (Y) ? (X) : (Y))
 #define max(X,Y) ((X) > (Y) ? (X) : (Y))
 
-#define ENABLE_AEOLUS 1
+#define ENABLE_AEOLUS 0
 
 #define SERVERNUM 9 // including one warm-up server
 #define MAX_TIME 30 // in second
-static struct   ether_addr eth_addr_array[SERVERNUM];
+static struct ether_addr eth_addr_array[SERVERNUM];
 static uint32_t ip_addr_array[SERVERNUM];
 
 /* Output level:
@@ -90,16 +90,16 @@ static uint32_t ip_addr_array[SERVERNUM];
     verbose = 2; packet level;
     verbose = 3; all.           
 */
-int verbose        = 1; 
-int total_flow_num = 15; // total flows among all servers 
+int verbose        = 0; 
+int total_flow_num = 10000; // total flows among all servers 
 int this_server_id = 1;
 
 /* Configuration files to be placed in app/test-pmd/config/ */
 /* The first line (server_id=0) is used for warm-up receiver */
 static const char ethaddr_filename[] = "app/test-pmd/config/eth_addr_info.txt";
-static const char ipaddr_filename[]  = "app/test-pmd/config/ip_addr_info.txt";
+static const char ipaddr_filename[] = "app/test-pmd/config/ip_addr_info.txt";
 /* The first few lines are used for warm-up flows */
-static const char flow_filename[]    = "app/test-pmd/config/flow_info_test.txt";
+static const char flow_filename[] = "app/test-pmd/config/flow_info_gen.txt";
 
 #define DEFAULT_PKT_SIZE 1500
 #define L2_LEN sizeof(struct ether_hdr)
@@ -119,7 +119,7 @@ static const char flow_filename[]    = "app/test-pmd/config/flow_info_test.txt";
 #define ECT_1   0x02
 #define CE      0x03
 
-/* Homa header info */
+/* Homa packet type */
 #define PT_HOMA_GRANT_REQUEST  0x10
 #define PT_HOMA_GRANT          0x11
 #define PT_HOMA_DATA           0x12
@@ -150,7 +150,7 @@ static const char flow_filename[]    = "app/test-pmd/config/flow_info_test.txt";
 #define HOMA_RECV_CLOSED             0x06
 
 /* Homa transport configuration (parameters and variables) */
-#define RTT_BYTES (40*((DEFAULT_PKT_SIZE)-(HDR_ONLY_SIZE))) // Calculated based on BDP (max 2^16 bytes)
+#define RTT_BYTES (13*((DEFAULT_PKT_SIZE)-(HDR_ONLY_SIZE))) // Calculated based on BDP (max 2^16 bytes)
 #define MAX_GRANT_TRANSMIT_ONE_TIME 32
 #define MAX_REQUEST_RETRANSMIT_ONE_TIME 16
 #define RETRANSMIT_TIMEOUT 0.01
@@ -160,17 +160,9 @@ static const char flow_filename[]    = "app/test-pmd/config/flow_info_test.txt";
 #define SCHEDULED_PRIORITY 2 // Scheduled priority levels
 /* Map message size to divided n+1 unscheduled priorities */
 static const int prio_cut_off_bytes[] = {2000, 4000, 6000, 8000, 10000}; 
-/* 0-n from low to high priority map to DSCP field (TOS_8BIT=DSCP_6BIT+ECN_2BIT) 
-   Default DSCP to switch-priority mapping in MLNX-OS:
-    0  - 7   →  0
-    8  - 15  →  1
-    16 - 23  →  2
-    24 - 31  →  3
-    32 - 39  →  4
-    40 - 47  →  5
-    48 - 55  →  6
-    56 - 63  →  7 */
-static const uint8_t prio_dscp_map[] = {0x00, 0x20, 0x40, 0x60, 0x80, 0xa0, 0xc0, 0xe0}; 
+/* 0-n from low to high priority map to DSCP field (TOS_8BIT=DSCP_6BIT+ECN_2BIT) */
+static const uint8_t prio_dscp_map[] = {0x00, 0x00, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20}; 
+//static const uint8_t prio_dscp_map[] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}; 
 
 double start_cycle, elapsed_cycle;
 double flowgen_start_time;
@@ -210,10 +202,10 @@ struct flow_info *receiver_flows;
 
 struct rte_mbuf *sender_pkts_burst[MAX_PKT_BURST];
 struct rte_mbuf *receiver_pkts_burst[MAX_PKT_BURST];
-int sender_current_burst_size;
-int receiver_current_burst_size;
+int    sender_current_burst_size;
+int    receiver_current_burst_size;
 
-/* sender task states */
+/* Sender task states */
 int sender_total_flow_num              = 0; // sender flows for this server
 int sender_grant_request_sent_flow_num = 0;
 int sender_active_flow_num             = 0;
@@ -221,11 +213,11 @@ int sender_finished_flow_num           = 0;
 int sender_next_unstart_flow_id        = -1;
 int sender_current_burst_size          = 0;
 
-#define MAX_CONCURRENT_FLOW 100
+#define MAX_CONCURRENT_FLOW 10000
 int sender_request_sent_flow_array[MAX_CONCURRENT_FLOW];
 int sender_active_flow_array[MAX_CONCURRENT_FLOW];
 
-/* receiver task states */
+/* Receiver task states */
 int receiver_total_flow_num     = 0; // receiver flows for this server
 int receiver_active_flow_num    = 0;
 int receiver_finished_flow_num  = 0;
@@ -233,7 +225,7 @@ int receiver_current_burst_size = 0;
 
 int receiver_active_flow_array[MAX_CONCURRENT_FLOW];
 
-/* declaration of functions */
+/* Declaration of functions */
 static void
 main_flowgen(struct fwd_stream *fs);
 
