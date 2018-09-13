@@ -77,7 +77,7 @@
 #define min(X,Y) ((X) < (Y) ? (X) : (Y))
 #define max(X,Y) ((X) > (Y) ? (X) : (Y))
 
-#define ENABLE_AEOLUS 1
+#define ENABLE_AEOLUS 0
 
 #define SERVERNUM 9 // including one warm-up server
 #define MAX_TIME 10 // in second
@@ -91,7 +91,7 @@ static uint32_t ip_addr_array[SERVERNUM];
     verbose = 3; all.           
 */
 int verbose        = 0; 
-int total_flow_num = 201; // total flows among all servers 
+int total_flow_num = 79; // total flows among all servers 
 int this_server_id = 1;
 
 /* Configuration files to be placed in app/test-pmd/config/ */
@@ -99,7 +99,7 @@ int this_server_id = 1;
 static const char ethaddr_filename[] = "app/test-pmd/config/eth_addr_info.txt";
 static const char ipaddr_filename[] = "app/test-pmd/config/ip_addr_info.txt";
 /* The first few lines are used for warm-up flows */
-static const char flow_filename[] = "app/test-pmd/config/flow_info_incast_6gbps_200kb.txt";
+static const char flow_filename[] = "app/test-pmd/config/flow_info_incast.txt";
 
 #define DEFAULT_PKT_SIZE 1500
 #define L2_LEN sizeof(struct ether_hdr)
@@ -151,10 +151,10 @@ static const char flow_filename[] = "app/test-pmd/config/flow_info_incast_6gbps_
 #define HOMA_RECV_CLOSED             0x06
 
 /* Homa transport configuration (parameters and variables) */
-#define RTT_BYTES (13*((DEFAULT_PKT_SIZE)-(HDR_ONLY_SIZE))) // Calculated based on BDP (max 2^16 bytes)
+#define RTT_BYTES (13*((DEFAULT_PKT_SIZE)-(HDR_ONLY_SIZE))) 
 #define MAX_GRANT_TRANSMIT_ONE_TIME 32
 #define MAX_REQUEST_RETRANSMIT_ONE_TIME 16
-#define TIMEOUT 0.02
+#define TIMEOUT 0.01
 #define GRANT_INTERVAL 0.000005
 #define BURST_THRESHOLD 64
 
@@ -163,8 +163,8 @@ static const char flow_filename[] = "app/test-pmd/config/flow_info_incast_6gbps_
 /* Map message size to divided n+1 unscheduled priorities */
 static const int prio_cut_off_bytes[] = {2000, 4000, 6000, 8000, 10000, 12000}; 
 /* 0-n from low to high priority map to DSCP field (TOS_8BIT=DSCP_6BIT+ECN_2BIT) */
-//static const uint8_t prio_dscp_map[] = {0x00, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20}; 
-static const uint8_t prio_dscp_map[] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}; 
+static const uint8_t prio_dscp_map[] = {0x00, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20}; 
+//static const uint8_t prio_dscp_map[] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}; 
 
 double start_cycle, elapsed_cycle;
 double flowgen_start_time;
@@ -216,23 +216,22 @@ int    sender_current_burst_size;
 int    receiver_current_burst_size;
 
 /* Sender task states */
-int sender_total_flow_num              = 0; // sender flows for this server
+int sender_total_flow_num              = 0;
 int sender_grant_request_sent_flow_num = 0;
 int sender_finished_flow_num           = 0;
 int sender_next_unstart_flow_id        = -1;
 int sender_current_burst_size          = 0;
 
-#define MAX_CONCURRENT_FLOW 10000
-int sender_request_sent_flow_array[MAX_CONCURRENT_FLOW];
-int sender_active_flow_array[MAX_CONCURRENT_FLOW];
-
 /* Receiver task states */
-int receiver_total_flow_num      = 0; // receiver flows for this server
+int receiver_total_flow_num      = 0;
 int receiver_active_flow_num     = 0; 
 int max_receiver_active_flow_num = 0;
 int receiver_finished_flow_num   = 0;
 int receiver_current_burst_size  = 0;
 
+#define MAX_CONCURRENT_FLOW 10000
+int sender_request_sent_flow_array[MAX_CONCURRENT_FLOW];
+int sender_active_flow_array[MAX_CONCURRENT_FLOW];
 int receiver_active_flow_array[MAX_CONCURRENT_FLOW];
 
 /* Declaration of functions */
@@ -423,6 +422,7 @@ add_sender_grant_request_sent_flow(int flow_id)
     sender_grant_request_sent_flow_num++;
     sender_next_unstart_flow_id = find_next_unstart_flow_id();
     sender_flows[flow_id].flow_state = HOMA_SEND_GRANT_REQUEST_SENT; 
+    sender_flows[flow_id].first_request_access_time = rte_rdtsc() / (double)hz;
     sender_flows[flow_id].last_grant_request_sent_time = rte_rdtsc() / (double)hz;
 }
 
@@ -669,7 +669,7 @@ init(void)
         sender_flows[flow_id].remain_size               = flow_size;
         sender_flows[flow_id].data_seqnum               = 1;
         sender_flows[flow_id].start_time                = start_time;
-        sender_flows[flow_id].first_request_access_time = rte_rdtsc() / (double)hz;
+        sender_flows[flow_id].first_request_access_time = -1.0;
         sender_flows[flow_id].last_grant_sent_time      = 0;
         sender_flows[flow_id].flow_state                = HOMA_SEND_UNSTARTED;
         sender_flows[flow_id].first_grant_access_time   = -1.0;
@@ -734,7 +734,6 @@ construct_sync(int dst_server_id){
     ip_hdr = (struct ipv4_hdr *)(eth_hdr + 1);
     memset(ip_hdr, 0, L3_LEN);
     ip_hdr->version_ihl     = IP_VHL_DEF;
-    /* Highest priority for grants & resend requests */
     ip_hdr->type_of_service = prio_dscp_map[SCHEDULED_PRIORITY+UNSCHEDULED_PRIORITY-1] | (ECT_1); 
     ip_hdr->fragment_offset = 0;
     ip_hdr->time_to_live    = IP_DEFTTL;
@@ -747,11 +746,11 @@ construct_sync(int dst_server_id){
 
     /* Initialize transport header. */
     transport_hdr = (struct tcp_hdr *)(ip_hdr + 1);
-    transport_hdr->src_port              = 55555;
-    transport_hdr->dst_port              = 55555;
-    transport_hdr->sent_seq              = 0;
-    transport_hdr->recv_ack              = 0;
-    transport_hdr->PKT_TYPE_8BITS        = PT_SYNC;
+    transport_hdr->src_port       = 55555;
+    transport_hdr->dst_port       = 55555;
+    transport_hdr->sent_seq       = 0;
+    transport_hdr->recv_ack       = 0;
+    transport_hdr->PKT_TYPE_8BITS = PT_SYNC;
     
     tx_offloads = ports[global_fs->tx_port].dev_conf.txmode.offloads;
     if (tx_offloads & DEV_TX_OFFLOAD_VLAN_INSERT)
@@ -811,7 +810,6 @@ construct_grant_request(uint32_t flow_id)
     ip_hdr = (struct ipv4_hdr *)(eth_hdr + 1);
     memset(ip_hdr, 0, L3_LEN);
     ip_hdr->version_ihl     = IP_VHL_DEF;
-    /* Highest priority for grants & resend requests */
     ip_hdr->type_of_service = prio_dscp_map[SCHEDULED_PRIORITY+UNSCHEDULED_PRIORITY-1] | (ECT_1); 
     ip_hdr->fragment_offset = 0;
     ip_hdr->time_to_live    = IP_DEFTTL;
@@ -891,7 +889,6 @@ construct_grant(uint32_t flow_id, uint32_t seq_granted, uint8_t priority_granted
     ip_hdr = (struct ipv4_hdr *)(eth_hdr + 1);
     memset(ip_hdr, 0, L3_LEN);
     ip_hdr->version_ihl     = IP_VHL_DEF;
-    /* Highest priority for grants & resend requests */
     ip_hdr->type_of_service = prio_dscp_map[SCHEDULED_PRIORITY+UNSCHEDULED_PRIORITY-1] | (ECT_1);
     ip_hdr->fragment_offset = 0;
     ip_hdr->time_to_live    = IP_DEFTTL;
@@ -1072,7 +1069,6 @@ construct_resend_request(uint32_t flow_id, uint32_t resend_size)
     ip_hdr = (struct ipv4_hdr *)(eth_hdr + 1);
     memset(ip_hdr, 0, L3_LEN);
     ip_hdr->version_ihl     = IP_VHL_DEF;
-    /* Highest priority for grants & resend requests */
     ip_hdr->type_of_service = prio_dscp_map[SCHEDULED_PRIORITY+UNSCHEDULED_PRIORITY-1] | (ECT_1);
     ip_hdr->fragment_offset = 0;
     ip_hdr->time_to_live    = IP_DEFTTL;
@@ -1090,7 +1086,7 @@ construct_resend_request(uint32_t flow_id, uint32_t resend_size)
     transport_hdr->sent_seq           = rte_cpu_to_be_32(receiver_flows[flow_id].data_seqnum);
     transport_hdr->recv_ack           = 0;
     transport_hdr->PKT_TYPE_8BITS     = PT_HOMA_RESEND_REQUEST;
-    transport_hdr->FLOW_ID_16BITS = rte_cpu_to_be_16((uint16_t)(flow_id & 0xffff));
+    transport_hdr->FLOW_ID_16BITS     = rte_cpu_to_be_16((uint16_t)(flow_id & 0xffff));
     transport_hdr->DATA_RESEND_16BITS = rte_cpu_to_be_16((uint16_t)(resend_size & 0xffff));
 
     tx_offloads = ports[global_fs->tx_port].dev_conf.txmode.offloads;
@@ -1185,8 +1181,8 @@ process_ack(struct tcp_hdr* transport_recv_hdr)
                     receiver_flows[flow_id].remain_size, resend_size);
             }
             construct_resend_request(flow_id, resend_size);
-            construct_grant(flow_id, RTT_BYTES+1, 0);
-            receiver_flows[flow_id].last_grant_sent_time = rte_rdtsc() / (double)hz;
+            //construct_grant(flow_id, RTT_BYTES+1, 0);
+            //receiver_flows[flow_id].last_grant_sent_time = rte_rdtsc() / (double)hz;
             //receiver_flows[flow_id].resend_request_counter++;
         }
     }
@@ -1225,7 +1221,7 @@ recv_grant_request(struct tcp_hdr *transport_recv_hdr, struct ipv4_hdr *ipv4_hdr
     receiver_flows[flow_id].last_grant_granted_seq  = RTT_BYTES+1;
     receiver_flows[flow_id].last_grant_granted_prio = 0;
     receiver_flows[flow_id].resend_request_counter  = 0;
-    receiver_flows[flow_id].first_grant_access_time   = -1.0;
+    receiver_flows[flow_id].first_grant_access_time = -1.0;
 
     if (verbose > 0) {
         print_elapsed_time();
@@ -1287,6 +1283,7 @@ recv_grant(struct tcp_hdr *transport_recv_hdr)
                     now - sender_flows[flow_id].wait_close_start_time >= 100*TIMEOUT) {
                     sender_finished_flow_num++;
                     sender_flows[flow_id].flow_state = HOMA_SEND_CLOSED;
+                    sender_flows[flow_id].flow_finished = 1;
                     sender_flows[flow_id].finish_time = rte_rdtsc() / (double)hz;
                     if (verbose > 0) {
                         print_elapsed_time();
@@ -1339,7 +1336,6 @@ recv_resend_request(struct tcp_hdr *transport_recv_hdr)
             flow_id, sender_flows[flow_id].data_seqnum, sender_flows[flow_id].remain_size, resend_size);
     }
 }
-
 
 /* Receive and process a burst of packets. */
 static void
@@ -1602,7 +1598,7 @@ start_new_flow(void)
 static void
 main_flowgen(struct fwd_stream *fs)
 {
-    /* Initialize global variables*/
+    /* Initialize global variables */
     rte_delay_ms(1000);
     global_fs = fs;
     hz = rte_get_timer_hz(); 
@@ -1627,7 +1623,6 @@ main_flowgen(struct fwd_stream *fs)
     elapsed_cycle = 0;
     flowgen_start_time = start_cycle / (double)hz;
     start_warm_up_flow();
-    /* Sync all servers */
     while (elapsed_cycle/(double)hz < warm_up_time) {
         recv_pkt(fs);
         send_grant();
@@ -1654,14 +1649,13 @@ main_flowgen(struct fwd_stream *fs)
     /* Main flowgen loop */
     printf("\nEnter main_flowgen loop...\n\n");
     printf("MAX_TIME = %d sec after warm up\n", MAX_TIME);
-    double loop_time = warm_up_time + MAX_TIME; // main loop time in sec
+    double loop_time = warm_up_time + MAX_TIME;
     int    main_flowgen_loop = 1;
     double total_time_phase1 = 0;
     double total_time_phase2 = 0;
     double total_time_phase3 = 0;
     double now;
     long int loop_num = 0;
-    /* Do not exit main loop if not reaching loop_time */
     while (elapsed_cycle < loop_time*hz) {
         loop_num++;
         if (verbose > 2) {
