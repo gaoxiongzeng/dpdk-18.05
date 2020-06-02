@@ -1,5 +1,5 @@
 # Homa DPDK implementation with Aeolus support
-This project implements Homa (sigcomm'17) transport protocol with Aeolus (sigcomm'20) support.
+This project implements Homa (sigcomm'18) transport protocol with Aeolus (sigcomm'20) support.
 
 ## File description:
 - ```dpdk-18.05/app/test-pmd/flowgen.c```
