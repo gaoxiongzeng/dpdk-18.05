@@ -1,7 +1,7 @@
 # Homa DPDK implementation with Aeolus support
 This project implements Homa (sigcomm'18) transport protocol with Aeolus (sigcomm'20) support.
 
-## File description:
+## File description
 - ```dpdk-18.05/app/test-pmd/flowgen.c```
 This file contains the major Homa implementation code with Aeolus support.
 
@@ -11,13 +11,13 @@ This folder contains the configuration files (e.g., server ip/eth address, traff
 - ```dpdk-18.05/app/test-pmd/result/```
 This folder contains the raw evaluation results of the Aeolus (sigcomm'20) paper.
 
-## System requirement:
+## System requirement
 Servers should run in Linux system with NICs supporting DPDK. Switches should support RED/ECN so as to enable Aeolus selective dropping. For example, the experiment setup in the Aeolus (sigcomm'20) paper: 
 * 8 HUAWEI Tecal RH1288 V2 servers.
 * 1 Mellanox SN2100 switch.
 * All servers are connected to the switch with Intel 82599EB 10GbE NIC.
 
-## How to run:
+## How to run
 Step 1: Download the source code and build the DPDK, following instructions in [DPDK - Getting Started Guide for Linux](http://doc.dpdk.org/guides/linux_gsg/build_dpdk.html).
 
 Step 2: Setup configuration files in ```dpdk-18.05/app/test-pmd/config/```
