@@ -61,3 +61,6 @@ Step 6: Collect results from each participating server. Server will print out it
 
 ## Contact
 If you have any question about this project, please contact [Gaoxiong Zeng](http://gaoxiongzeng.github.io/).
+
+## References
+- [Homa DPDK and Aeolus (SIGCOMM'20)](https://github.com/gaoxiongzeng/dpdk-18.05).
